@@ -1,1 +1,1 @@
-"""Tools for SearchAgentService_update."""
+"""Tools for SearchAgentService."""

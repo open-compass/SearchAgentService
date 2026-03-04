@@ -1,4 +1,4 @@
-# SearchAgentService_update Dependencies
+# SearchAgentService Dependencies
 
 # Main service
 fastapi>=0.100.0

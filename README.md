@@ -1,11 +1,11 @@
-# SearchAgentService_update
+# SearchAgentService
 
 AgentCompass compatible tool calling service with search, web crawling, and content extraction. Single-process deployment, no MCP required.
 
 ## Directory Structure
 
 ```
-SearchAgentService_update/
+SearchAgentService/
 ├── service.py           # Main service entry (FastAPI)
 ├── fc_inferencer.py     # Core inferencer (Function Calling)
 ├── tools/
@@ -122,5 +122,5 @@ curl http://localhost:8083/health
 Response:
 
 ```json
-{"status": "healthy", "service": "SearchAgentService_update"}
+{"status": "healthy", "service": "SearchAgentService"}
 ```

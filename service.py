@@ -1,5 +1,5 @@
 """
-SearchAgentService_update - AgentCompass compatible tool calling service.
+SearchAgentService - AgentCompass compatible tool calling service.
 
 Usage:
     uvicorn service:app --host 0.0.0.0 --port 8083
@@ -26,9 +26,9 @@ from fc_inferencer import AsyncFCInferencer, ChatMessage
 from tools.registry import build_default_registry
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("SearchAgentService_update")
+logger = logging.getLogger("SearchAgentService")
 
-app = FastAPI(title="SearchAgentService_update")
+app = FastAPI(title="SearchAgentService")
 
 
 class TaskRequest(BaseModel):
@@ -142,14 +142,14 @@ async def run_task(request: TaskRequest):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "service": "SearchAgentService_update"}
+    return {"status": "healthy", "service": "SearchAgentService"}
 
 
 if __name__ == "__main__":
     import uvicorn
     import argparse
 
-    parser = argparse.ArgumentParser(description="SearchAgentService_update")
+    parser = argparse.ArgumentParser(description="SearchAgentService")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8083)
     parser.add_argument("--workers", type=int, default=4)
