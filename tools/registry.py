@@ -97,6 +97,7 @@ def _register_visit(registry: ToolRegistry, config: Dict[str, str]):
         model_name=config.get("MODEL_NAME", ""),
         base_url=config.get("BASE_URL", ""),
         api_key=config.get("API_KEY", "sk-admin"),
+        timeout=int(config.get("TIMEOUT", "10000")),
     )
     registry.register(VISIT_SCHEMA, visit)
 

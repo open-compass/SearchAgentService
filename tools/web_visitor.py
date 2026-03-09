@@ -28,7 +28,7 @@ JINA_TIMEOUT = 50
 JINA_MAX_RETRIES = 10
 
 # LLM config
-LLM_TIMEOUT = 600
+LLM_TIMEOUT = 1000
 LLM_MAX_RETRY = 50
 LLM_SLEEP_INTERVAL = 5
 
@@ -205,7 +205,7 @@ http_session: aiohttp.ClientSession = None
 
 
 def configure(jina_api_key: str = "", model_name: str = "",
-              base_url: str = "", api_key: str = "sk-admin"):
+              base_url: str = "", api_key: str = "sk-admin", timeout: int = 1000):
     """Initialize web_visitor config, called by registry during build.
 
     Args:
@@ -213,8 +213,9 @@ def configure(jina_api_key: str = "", model_name: str = "",
         model_name: LLM model name
         base_url: LLM base URL (supports comma-separated multiple URLs)
         api_key: LLM API key
+        timeout: LLM request timeout in seconds
     """
-    global MODEL_NAME, BASE_URL, API_KEY, JINA_API_KEY, llm, _configured
+    global MODEL_NAME, BASE_URL, API_KEY, JINA_API_KEY, LLM_TIMEOUT, llm, _configured
 
     if _configured:
         return
@@ -223,6 +224,7 @@ def configure(jina_api_key: str = "", model_name: str = "",
     BASE_URL = base_url
     API_KEY = api_key
     JINA_API_KEY = jina_api_key
+    LLM_TIMEOUT = timeout
     llm = LLMClient()
     _configured = True
 

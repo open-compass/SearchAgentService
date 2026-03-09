@@ -114,13 +114,12 @@ class AsyncFCInferencer:
     def __init__(
         self,
         model: ModelConfig,
-        sample_params: Optional[SampleParameters] = None,
+        model_infer_params: Optional[dict] = None,
         registry: Optional[ToolRegistry] = None,
         max_iterations: int = 50,
         timeout: int = 600,
         max_retry: int = 50,
         sleep_interval: int = 5,
-        extra_body: Optional[dict] = None,
         max_tool_response_length: Optional[int] = 4096,
         max_tool_calls_per_turn: int = 5,
     ):
@@ -131,16 +130,14 @@ class AsyncFCInferencer:
         ]
 
         self.model_name = model["model"]
-        self.sample_params = sample_params or {}
+        self.model_infer_params = model_infer_params or {}
         self.max_iterations = max_iterations
         self.timeout = timeout
         self.max_retry = max_retry
         self.sleep_interval = sleep_interval
-        self.extra_body = extra_body
         self.max_tool_response_length = max_tool_response_length
         self.max_tool_calls_per_turn = max_tool_calls_per_turn
 
-        # Use the provided registry, or build a default one
         self.registry = registry or build_default_registry()
 
     async def infer(self, messages: List[ChatMessage]) -> List[dict]:
@@ -158,6 +155,8 @@ class AsyncFCInferencer:
             choice = response.choices[0]
             message_data = choice.message
             assistant_msg = message_data.model_dump(exclude_none=True)
+            if "content" not in assistant_msg:
+                assistant_msg["content"] = ""
             current_messages.append(assistant_msg)
 
             if not message_data.tool_calls:
@@ -182,16 +181,17 @@ class AsyncFCInferencer:
         for attempt in range(self.max_retry):
             try:
                 client = random.choice(self.clients)
-                response = await client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    tools=tools_schema if tools_schema else None,
-                    stream=False,
-                    temperature=self.sample_params.get("temperature", 0.7),
-                    top_p=self.sample_params.get("top_p", 1.0),
-                    timeout=self.timeout,
-                    extra_body=self.extra_body,
-                )
+
+                call_params = {
+                    "model": self.model_name,
+                    "messages": messages,
+                    "tools": tools_schema if tools_schema else None,
+                    "stream": False,
+                    "timeout": self.timeout,
+                    **self.model_infer_params
+                }
+
+                response = await client.chat.completions.create(**call_params)
                 return response
             except (APITimeoutError, TimeoutError) as e:
                 logger.error(f"LLM Timeout (attempt {attempt + 1}): {e}")

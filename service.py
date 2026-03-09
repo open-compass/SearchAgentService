@@ -79,10 +79,6 @@ async def run_task(request: TaskRequest):
     }
 
     model_infer_params = llm_config.get("model_infer_params", {}) or {}
-    sample_params = {
-        "temperature": model_infer_params.get("temperature", 0.7),
-        "top_p": model_infer_params.get("top_p", 1.0),
-    }
 
     max_iterations = int(env_params.get("MAX_ITERATIONS", "50"))
     timeout = int(env_params.get("TIMEOUT", "600"))
@@ -99,6 +95,7 @@ async def run_task(request: TaskRequest):
         "MODEL_NAME": env_params.get("MODEL_NAME", "") or llm_config.get("model_name", ""),
         "BASE_URL": env_params.get("BASE_URL", "") or llm_config.get("url", ""),
         "API_KEY": env_params.get("API_KEY", "") or llm_config.get("api_key", "sk-admin"),
+        "TIMEOUT": str(timeout),
     }
     # Parse enabled tools list (comma-separated), default: search,visit
     tools_str = env_params.get("TOOLS", "")
@@ -108,7 +105,7 @@ async def run_task(request: TaskRequest):
 
     inferencer = AsyncFCInferencer(
         model=model_config,
-        sample_params=sample_params,
+        model_infer_params=model_infer_params,
         registry=registry,
         max_iterations=max_iterations,
         timeout=timeout,
