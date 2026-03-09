@@ -152,7 +152,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SearchAgentService")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8083)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
 
     logger.info(f"Starting on {args.host}:{args.port}")

@@ -21,7 +21,7 @@ SearchAgentService/
 
 ```bash
 pip install -r requirements.txt
-python service.py --host 0.0.0.0 --port 8083 --workers 4
+python service.py --host 0.0.0.0 --port 8083
 ```
 
 ## Configuration
