@@ -6,6 +6,7 @@ Reference: https://github.com/Alibaba-NLP/DeepResearch/blob/main/inference/tool_
 """
 import asyncio
 import json
+import os
 import random
 import time
 from typing import Dict, List, Union
@@ -24,13 +25,13 @@ _configured = False
 
 # Web fetching config
 JINA_URL = "https://r.jina.ai/"
-JINA_TIMEOUT = 50
-JINA_MAX_RETRIES = 10
+JINA_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "2000")) // 2
+JINA_MAX_RETRIES = int(os.getenv("MAX_RETRY", "10"))
 
 # LLM config
-LLM_TIMEOUT = 1000
-LLM_MAX_RETRY = 50
-LLM_SLEEP_INTERVAL = 5
+LLM_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "2000"))
+LLM_MAX_RETRY = int(os.getenv("MAX_RETRY", "10"))
+LLM_SLEEP_INTERVAL = int(os.getenv("RETRY_INTERVAL", "5"))
 
 # Content truncation config
 MAX_CONTENT_CHARS = 150000
@@ -87,7 +88,7 @@ async def fetch_page(url: str, session: aiohttp.ClientSession) -> str:
                 "Authorization": f"Bearer {JINA_API_KEY}",
                 "Accept": "text/plain",
                 "X-Return-Format": "text",
-                "X-Timeout": "10",
+                "X-Timeout": str(JINA_TIMEOUT),
             }
             async with session.get(
                 f"{JINA_URL}{url}",
@@ -215,7 +216,7 @@ def configure(jina_api_key: str = "", model_name: str = "",
         api_key: LLM API key
         timeout: LLM request timeout in seconds
     """
-    global MODEL_NAME, BASE_URL, API_KEY, JINA_API_KEY, LLM_TIMEOUT, llm, _configured
+    global MODEL_NAME, BASE_URL, API_KEY, JINA_API_KEY, llm, _configured
 
     if _configured:
         return
@@ -224,7 +225,6 @@ def configure(jina_api_key: str = "", model_name: str = "",
     BASE_URL = base_url
     API_KEY = api_key
     JINA_API_KEY = jina_api_key
-    LLM_TIMEOUT = timeout
     llm = LLMClient()
     _configured = True
 
@@ -242,15 +242,14 @@ async def visit(url: Union[str, List[str]], goal: str) -> str:
     session = await get_session()
 
     if isinstance(url, str):
-        return await visit_single_url(url, goal, llm, session)
+        try:
+            return await visit_single_url(url, goal, llm, session)
+        except Exception as e:
+            return FAILED_MSG_TEMPLATE.format(url=url, goal=goal)
 
-    # Multiple URLs: process sequentially, skip remaining after 900s timeout
+    # Multiple URLs: process sequentially
     results = []
-    start = time.time()
     for u in url:
-        if time.time() - start > 900:
-            results.append(FAILED_MSG_TEMPLATE.format(url=u, goal=goal))
-            continue
         try:
             r = await visit_single_url(u, goal, llm, session)
         except Exception as e:

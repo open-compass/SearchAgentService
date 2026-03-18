@@ -26,35 +26,42 @@ python service.py --host 0.0.0.0 --port 8083
 
 ## Configuration
 
-Tool configuration is passed via AgentCompass `service_env_params`:
+### Environment Variables
 
-```yaml
-gaia:
-  model: "qwen3-235b"
-  judge_model: "gpt-4o"
-  service_url: "http://localhost:8083/api/tasks"
-  service_env_params:
-    SERPER_API_KEY: "your-serper-api-key"
-    JINA_API_KEY: "your-jina-api-key"
-    TOOLS: "search,visit"
-    MAX_ITERATIONS: "50"
-    TIMEOUT: "600"
+SearchAgentService supports centralized configuration via `.env` file or environment variables.
+
+**Setup:**
+```bash
+# Copy example config
+cp .env.example .env
+
+# Edit values as needed
+vim .env
 ```
 
-### service_env_params
+**Available Parameters:**
 
-| Parameter | Description | Required |
-|-----------|-------------|----------|
-| TOOLS | Comma-separated list of enabled tools. Options: search, browse, visit | No (default: search,visit) |
-| SERPER_API_KEY | Serper search API key. Supports multiple keys (comma-separated, with optional `_ratelimit_N` suffix) | Yes |
-| JINA_API_KEY | Jina Reader API key. Supports multiple keys (same format as above) | Yes |
-| MODEL_NAME | LLM model name for web_visitor tool. Falls back to llm_config.model_name if not set | No |
-| BASE_URL | LLM endpoint for web_visitor tool. Falls back to llm_config.url if not set | No |
-| API_KEY | LLM API key for web_visitor tool. Falls back to llm_config.api_key if not set | No |
-| MAX_ITERATIONS | Maximum iteration count | No (default: 50) |
-| TIMEOUT | LLM request timeout in seconds | No (default: 600) |
-| MAX_RETRY | Maximum retry count | No (default: 50) |
-| SLEEP_INTERVAL | Retry interval in seconds | No (default: 5) |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| **Timeouts (seconds)** |
+| TIMEOUT | HTTP connect/write/pool timeout | 60 |
+| REQUEST_TIMEOUT | LLM/API request timeout | 2000 |
+| **Retry Configuration** |
+| MAX_RETRY | Maximum retry attempts | 10 |
+| RETRY_INTERVAL | Retry interval (seconds) | 5 |
+| **Execution Limits** |
+| MAX_ITERATIONS | Maximum agent iterations | 50 |
+| MAX_TOOL_CALLS_PER_TURN | Maximum tool calls per turn | 5 |
+| MAX_TOOL_RESPONSE_LENGTH | Maximum tool response length | 8192 |
+| **Connection Pool** |
+| MAX_CONNECTIONS | Maximum total connections | 1024 |
+| MAX_KEEPALIVE_CONNECTIONS | Maximum keep-alive connections | 512 |
+| KEEPALIVE_EXPIRY | Connection expiry (seconds) | 10.0 |
+
+**Parameter Guidelines:**
+- **REQUEST_TIMEOUT**: 300-600s for fast models, 1000-2000s for thinking models
+- **MAX_RETRY**: 3-5 for fast failure, 10-25 for production stability
+- **MAX_ITERATIONS**: 20-30 prevents infinite loops, 40-50 allows complex tasks
 
 ## API
 
