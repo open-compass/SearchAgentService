@@ -1,10 +1,5 @@
 """
 Async Function Call Inferencer with direct tool calling.
-
-This module provides an async inferencer that supports direct tool calling
-(no MCP protocol) with multiple LLM backends and load balancing.
-
-Adapted from search_dataprocess-main for AgentCompass integration.
 """
 
 import asyncio
