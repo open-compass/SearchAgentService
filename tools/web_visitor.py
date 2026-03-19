@@ -82,6 +82,7 @@ def truncate_text(text: str, max_chars: int = MAX_CONTENT_CHARS) -> str:
 # =============================================================================
 async def fetch_page(url: str, session: aiohttp.ClientSession) -> str:
     """Fetch web page content via Jina Reader with retries."""
+    proxy_url = os.environ.get("https_proxy") or os.environ.get("http_proxy")
     for attempt in range(JINA_MAX_RETRIES):
         try:
             headers = {
@@ -90,14 +91,26 @@ async def fetch_page(url: str, session: aiohttp.ClientSession) -> str:
                 "X-Return-Format": "text",
                 "X-Timeout": str(JINA_TIMEOUT),
             }
-            async with session.get(
-                f"{JINA_URL}{url}",
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=JINA_TIMEOUT),
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.text()
-                print(f"[fetch_page] HTTP {resp.status} for {url}")
+            if proxy_url == "":
+                async with session.get(
+                    f"{JINA_URL}{url}",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=JINA_TIMEOUT),
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.text()
+                    print(f"[fetch_page] HTTP {resp.status} for {url}")
+            else:
+                async with session.get(
+                    f"{JINA_URL}{url}",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=JINA_TIMEOUT),
+                    proxy=proxy_url,
+                    ssl=False
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.text()
+                    print(f"[fetch_page] HTTP {resp.status} for {url}")
         except Exception as e:
             print(f"[fetch_page] attempt {attempt + 1} failed: {e}")
             await asyncio.sleep(0.5)
