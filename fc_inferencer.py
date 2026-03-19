@@ -25,38 +25,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AsyncFCInferencer")
 
 
-# Global shared HTTP client for connection pooling across all inferencer instances
-_global_http_client = None
-
-def get_shared_http_client() -> httpx.AsyncClient:
-    """Get or create shared HTTP client with connection pooling."""
-    global _global_http_client
-    if _global_http_client is None:
-        max_connections = int(os.getenv("MAX_CONNECTIONS", "1024"))
-        max_keepalive = int(os.getenv("MAX_KEEPALIVE_CONNECTIONS", "512"))
-        keepalive_expiry = float(os.getenv("KEEPALIVE_EXPIRY", "10.0"))
-
-        timeout = float(os.getenv("TIMEOUT", "60.0"))
-        request_timeout = float(os.getenv("REQUEST_TIMEOUT", "2000.0"))
-
-        _global_http_client = httpx.AsyncClient(
-            limits=httpx.Limits(
-                max_connections=max_connections,
-                max_keepalive_connections=max_keepalive,
-                keepalive_expiry=keepalive_expiry
-            ),
-            timeout=httpx.Timeout(
-                connect=timeout,
-                read=request_timeout,
-                write=timeout,
-                pool=timeout
-            )
-        )
-        logger.info(f"Created shared HTTP client: max_connections={max_connections}, "
-                   f"max_keepalive={max_keepalive}, timeouts=(connect/write/pool={timeout}, read={request_timeout})")
-    return _global_http_client
-
-
 def get_middle_mixed(text: str, max_num: int = 4000) -> str:
     """
     Truncate mixed Chinese-English text, keeping head and tail.
@@ -159,14 +127,32 @@ class AsyncFCInferencer:
     ):
         base_urls = model['base_url'] if isinstance(model['base_url'], list) else [model['base_url']]
 
-        # Use shared HTTP client for connection pooling
-        shared_client = get_shared_http_client()
+        # Create independent HTTP client for this instance
+        max_connections = int(os.getenv("MAX_CONNECTIONS", "100"))
+        max_keepalive = int(os.getenv("MAX_KEEPALIVE_CONNECTIONS", "20"))
+        keepalive_expiry = float(os.getenv("KEEPALIVE_EXPIRY", "10.0"))
+        http_timeout = float(os.getenv("TIMEOUT", "60.0"))
+        request_timeout = float(os.getenv("REQUEST_TIMEOUT", "2000.0"))
+
+        self.http_client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive,
+                keepalive_expiry=keepalive_expiry
+            ),
+            timeout=httpx.Timeout(
+                connect=http_timeout,
+                read=request_timeout,
+                write=http_timeout,
+                pool=http_timeout
+            )
+        )
 
         self.clients = [
             AsyncOpenAI(
                 api_key=model.get("api_key") or "dummy",
                 base_url=url,
-                http_client=shared_client,
+                http_client=self.http_client,
                 max_retries=0  # Disable SDK auto-retry, use application-level retry only
             )
             for url in base_urls
@@ -312,8 +298,9 @@ class AsyncFCInferencer:
         return None
 
     async def close(self):
-        """Close resources. Note: shared HTTP client is not closed here."""
-        pass
+        """Close HTTP client and release all connections."""
+        if hasattr(self, 'http_client'):
+            await self.http_client.aclose()
 
     def extract_final_answer(self, messages: List[dict]) -> str:
         """Extract final answer from message history."""

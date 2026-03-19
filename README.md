@@ -53,9 +53,9 @@ vim .env
 | MAX_ITERATIONS | Maximum agent iterations | 50 |
 | MAX_TOOL_CALLS_PER_TURN | Maximum tool calls per turn | 5 |
 | MAX_TOOL_RESPONSE_LENGTH | Maximum tool response length | 8192 |
-| **Connection Pool** |
-| MAX_CONNECTIONS | Maximum total connections | 1024 |
-| MAX_KEEPALIVE_CONNECTIONS | Maximum keep-alive connections | 512 |
+| **Connection Pool (per task instance)** |
+| MAX_CONNECTIONS | Maximum connections per task | 256 |
+| MAX_KEEPALIVE_CONNECTIONS | Maximum keep-alive connections per task | 64 |
 | KEEPALIVE_EXPIRY | Connection expiry (seconds) | 10.0 |
 
 **Parameter Guidelines:**
