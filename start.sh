@@ -1,5 +1,6 @@
 #!/bin/bash
 # Start SearchAgentService
+set -euo pipefail
 
 cd "$(dirname "$0")"
 
@@ -9,4 +10,4 @@ WORKERS="${WORKERS:-1}"
 
 echo "Starting SearchAgentService on ${HOST}:${PORT} with ${WORKERS} workers"
 
-uvicorn service:app --host "$HOST" --port "$PORT" --workers "$WORKERS"
+exec uvicorn service:app --host "$HOST" --port "$PORT" --workers "$WORKERS"

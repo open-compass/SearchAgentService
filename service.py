@@ -17,9 +17,12 @@ Configuration (via AgentCompass):
 """
 
 import logging
+import os
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI
+from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from fc_inferencer import AsyncFCInferencer, ChatMessage
@@ -27,6 +30,8 @@ from tools.registry import build_default_registry
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SearchAgentService")
+
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
 
 app = FastAPI(title="SearchAgentService")
 
@@ -46,6 +51,27 @@ class TaskResponse(BaseModel):
     trajectory: Optional[List[Dict]] = None
     status: str = "completed"
     error: Optional[str] = None
+
+
+def _get_runtime_param(
+    request_env_params: Dict[str, str],
+    key: str,
+    default: str = "",
+    aliases: Optional[List[str]] = None,
+) -> str:
+    """Resolve a runtime parameter from request env params first, then process env."""
+    candidates = [key, *(aliases or [])]
+
+    for candidate in candidates:
+        if candidate in request_env_params and request_env_params[candidate] is not None:
+            return str(request_env_params[candidate])
+
+    for candidate in candidates:
+        value = os.getenv(candidate)
+        if value is not None:
+            return value
+
+    return default
 
 
 @app.post("/api/tasks", response_model=TaskResponse)
@@ -80,25 +106,25 @@ async def run_task(request: TaskRequest):
 
     model_infer_params = llm_config.get("model_infer_params", {}) or {}
 
-    max_iterations = int(env_params.get("MAX_ITERATIONS", "50"))
-    timeout = int(env_params.get("TIMEOUT", "600"))
-    max_retry = int(env_params.get("MAX_RETRY", "50"))
-    sleep_interval = int(env_params.get("SLEEP_INTERVAL", "5"))
+    max_iterations = int(_get_runtime_param(env_params, "MAX_ITERATIONS", "50"))
+    timeout = int(_get_runtime_param(env_params, "REQUEST_TIMEOUT", "2000", aliases=["TIMEOUT"]))
+    max_retry = int(_get_runtime_param(env_params, "MAX_RETRY", "10"))
+    sleep_interval = int(_get_runtime_param(env_params, "SLEEP_INTERVAL", "5", aliases=["RETRY_INTERVAL"]))
 
     task_id = params.get("task_id", "unknown")
     logger.info(f"Starting task {task_id}, model: {model_config['model']}")
 
     # Extract tool API keys from service_env_params and build registry
     tool_config = {
-        "SERPER_API_KEY": env_params.get("SERPER_API_KEY", ""),
-        "JINA_API_KEY": env_params.get("JINA_API_KEY", ""),
-        "MODEL_NAME": env_params.get("MODEL_NAME", "") or llm_config.get("model_name", ""),
-        "BASE_URL": env_params.get("BASE_URL", "") or llm_config.get("url", ""),
-        "API_KEY": env_params.get("API_KEY", "") or llm_config.get("api_key", "sk-admin"),
+        "SERPER_API_KEY": _get_runtime_param(env_params, "SERPER_API_KEY"),
+        "JINA_API_KEY": _get_runtime_param(env_params, "JINA_API_KEY"),
+        "MODEL_NAME": _get_runtime_param(env_params, "MODEL_NAME") or llm_config.get("model_name", ""),
+        "BASE_URL": _get_runtime_param(env_params, "BASE_URL") or llm_config.get("url", ""),
+        "API_KEY": _get_runtime_param(env_params, "API_KEY") or llm_config.get("api_key", "sk-admin"),
         "TIMEOUT": str(timeout),
     }
     # Parse enabled tools list (comma-separated), default: search,visit
-    tools_str = env_params.get("TOOLS", "")
+    tools_str = _get_runtime_param(env_params, "TOOLS")
     tools = [t.strip() for t in tools_str.split(",") if t.strip()] if tools_str else None
 
     registry = build_default_registry(config=tool_config, tools=tools)
