@@ -98,7 +98,7 @@ curl http://localhost:8083/health
 
 `service.py` automatically loads `./.env` on startup. In Docker mode, prefer `--env-file ./.env`.
 
-Parameter priority:
+Resolution priority:
 
 1. `service_env_params` in the request
 2. Process environment variables or `./.env`
@@ -106,34 +106,43 @@ Parameter priority:
 
 ### Environment Variables
 
+SearchAgentService has two configuration paths for environment variables:
+
+#### 1. Can be passed from AgentCompass
+
+These are read from `service_env_params` first, then fall back to process env
+or `.env`.
+
+| Variable | Description | Default / Usage |
+|----------|-------------|-----------------|
+| SERPER_API_KEY | Serper API key for `search` | Required when `search` is enabled |
+| JINA_API_KEY | Jina API key for `browse` / `visit` | Required when `browse` or `visit` is enabled |
+| TOOLS | Enabled tools, chosen from `search,browse,visit` | Optional, default registry is `search,visit` |
+| MAX_RETRY | Maximum retry attempts | Default `10` |
+| RETRY_INTERVAL | Retry interval in seconds | Default `5` |
+| MAX_ITERATIONS | Maximum agent iterations | Default `50` |
+
+#### 2. Only effective via `.env` / process env
+
+These are not read from `service_env_params` in the current implementation.
+
 | Variable | Description | Default |
 |----------|-------------|---------|
 | HOST | Service bind host | 0.0.0.0 |
 | PORT | Service port | 8083 |
 | WORKERS | Uvicorn worker count | 1 |
-| TIMEOUT | HTTP connect/write/pool timeout | 60 |
-| REQUEST_TIMEOUT | LLM/API request timeout | 2000 |
-| MAX_RETRY | Maximum retry attempts | 10 |
-| RETRY_INTERVAL | Retry interval (seconds) | 5 |
-| MAX_ITERATIONS | Maximum agent iterations | 50 |
+| HTTP_TIMEOUT | Low-level HTTP connect/write/pool timeout | 300 |
 | MAX_TOOL_CALLS_PER_TURN | Maximum tool calls per turn | 5 |
-| MAX_TOOL_RESPONSE_LENGTH | Maximum tool response length | 8192 |
-| MAX_CONNECTIONS | Maximum connections per task | 256 |
-| MAX_KEEPALIVE_CONNECTIONS | Maximum keep-alive connections per task | 64 |
-| KEEPALIVE_EXPIRY | Connection expiry (seconds) | 10.0 |
-| SERPER_API_KEY | Serper search API key | empty |
-| JINA_API_KEY | Jina API key | empty |
-| TOOLS | Enabled tools, e.g. `search,visit` | default registry |
-| MODEL_NAME | Default model name for visit tool | empty |
-| BASE_URL | Default LLM base URL for visit tool | empty |
-| API_KEY | Default LLM API key for visit tool | empty |
+| MAX_TOOL_RESPONSE_LENGTH | Maximum tool response length before truncation | 8192 |
+| MAX_CONNECTIONS | Maximum connections per task instance | 256 |
+| MAX_KEEPALIVE_CONNECTIONS | Maximum keep-alive connections per task instance | 64 |
+| KEEPALIVE_EXPIRY | Keep-alive expiry in seconds | 10.0 |
 | http_proxy | HTTP proxy | empty |
 | https_proxy | HTTPS proxy | empty |
 
-Parameter guidelines:
-- **REQUEST_TIMEOUT**: 300-600s for fast models, 1000-2000s for thinking models
-- **MAX_RETRY**: 3-5 for fast failure, 10-25 for production stability
-- **MAX_ITERATIONS**: 20-30 prevents infinite loops, 40-50 allows complex tasks
+Notes:
+- AgentCompass `benchmark_params.request_timeout` controls how long AgentCompass waits for the HTTP response from SearchAgentService.
+- `REQUEST_TIMEOUT` still exists in `SearchAgentService/.env.example` as a local internal timeout setting for SearchAgentService itself, but it is not part of the documented user-facing `service_env_params` contract.
 
 ## API
 
@@ -158,9 +167,7 @@ curl -X POST "http://localhost:8001/api/tasks/batch" \
         "service_env_params": {
           "SERPER_API_KEY": "your-serper-api-key",
           "JINA_API_KEY": "your-jina-api-key",
-          "TOOLS": "search,visit",
-          "MAX_ITERATIONS": "50",
-          "TIMEOUT": "600"
+          "TOOLS": "search,visit"
         }
       },
       "model_infer_params": {

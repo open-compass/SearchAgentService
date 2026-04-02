@@ -126,7 +126,7 @@ class AsyncFCInferencer:
         max_connections = int(os.getenv("MAX_CONNECTIONS", "100"))
         max_keepalive = int(os.getenv("MAX_KEEPALIVE_CONNECTIONS", "20"))
         keepalive_expiry = float(os.getenv("KEEPALIVE_EXPIRY", "10.0"))
-        http_timeout = float(os.getenv("TIMEOUT", "60.0"))
+        http_timeout = float(os.getenv("HTTP_TIMEOUT", os.getenv("TIMEOUT", "60.0")))
         request_timeout = float(os.getenv("REQUEST_TIMEOUT", "2000.0"))
 
         self.http_client = httpx.AsyncClient(

@@ -97,7 +97,9 @@ def _register_visit(registry: ToolRegistry, config: Dict[str, str]):
         model_name=config.get("MODEL_NAME", ""),
         base_url=config.get("BASE_URL", ""),
         api_key=config.get("API_KEY", "sk-admin"),
-        timeout=int(config.get("TIMEOUT", "10000")),
+        request_timeout=int(config.get("REQUEST_TIMEOUT", "2000")),
+        max_retry=int(config.get("MAX_RETRY", "10")),
+        retry_interval=int(config.get("RETRY_INTERVAL", "5")),
     )
     registry.register(VISIT_SCHEMA, visit)
 
@@ -121,6 +123,9 @@ def build_default_registry(
             - MODEL_NAME: LLM model name for web_visitor
             - BASE_URL: LLM base URL for web_visitor
             - API_KEY: LLM API key for web_visitor
+            - REQUEST_TIMEOUT: LLM/web request timeout for web_visitor
+            - MAX_RETRY: Retry attempts for web_visitor
+            - RETRY_INTERVAL: Retry interval for web_visitor
         tools: List of tool names to register. Options: search, browse, visit.
             Default: ["search", "visit"].
     """
