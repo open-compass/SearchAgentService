@@ -158,6 +158,15 @@ async def run_task(request: TaskRequest):
         result = await inferencer.infer(messages)
 
         final_answer = inferencer.extract_final_answer(result)
+        if not str(final_answer or "").strip():
+            error = inferencer.last_error or "empty final answer"
+            logger.error(f"Task {task_id} failed: {error}")
+            return TaskResponse(
+                final_answer="",
+                trajectory=result,
+                status="failed",
+                error=error,
+            )
 
         logger.info(f"Task {task_id} completed")
         return TaskResponse(

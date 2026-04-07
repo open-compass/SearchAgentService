@@ -163,9 +163,19 @@ class AsyncFCInferencer:
         self.max_tool_calls_per_turn = max_tool_calls_per_turn or int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "5"))
 
         self.registry = registry or build_default_registry()
+        self.last_stop_reason: Optional[str] = None
+        self.last_error: Optional[str] = None
+
+    def _set_stop_state(self, reason: str, error: Optional[str] = None) -> None:
+        """Record why inference stopped so the service can surface failures."""
+        self.last_stop_reason = reason
+        if error not in (None, ""):
+            self.last_error = error
 
     async def infer(self, messages: List[ChatMessage]) -> List[dict]:
         """Run inference with tool calling loop."""
+        self.last_stop_reason = None
+        self.last_error = None
         current_messages = [m.model_dump(exclude_none=True) for m in messages]
         tools_schema = self.registry.schemas
 
@@ -174,6 +184,11 @@ class AsyncFCInferencer:
 
             response = await self._call_llm(current_messages, tools_schema)
             if response is None:
+                if self.last_stop_reason is None:
+                    self._set_stop_state(
+                        "llm_request_failed",
+                        self.last_error or f"LLM request failed after {self.max_retry} attempts",
+                    )
                 break
 
             choice = response.choices[0]
@@ -184,19 +199,36 @@ class AsyncFCInferencer:
             current_messages.append(assistant_msg)
 
             if not message_data.tool_calls:
+                self._set_stop_state("completed")
                 break
 
             if len(message_data.tool_calls) > self.max_tool_calls_per_turn:
-                logger.warning(f"Too many tool calls: {len(message_data.tool_calls)}")
+                tool_call_count = len(message_data.tool_calls)
+                error = (
+                    f"model returned {tool_call_count} tool calls in one turn, "
+                    f"exceeding limit {self.max_tool_calls_per_turn}"
+                )
+                logger.warning(f"Too many tool calls: {tool_call_count}")
+                self._set_stop_state("too_many_tool_calls", error)
                 break
 
             logger.info(f"Tools called: {[tc.function.name for tc in message_data.tool_calls]}")
 
             tool_results = await self._execute_tool_calls(message_data.tool_calls)
             if tool_results is None:
+                if self.last_stop_reason is None:
+                    self._set_stop_state(
+                        "tool_execution_failed",
+                        self.last_error or "Tool execution failed",
+                    )
                 break
 
             current_messages.extend(tool_results)
+        else:
+            self._set_stop_state(
+                "max_iterations_exceeded",
+                f"Reached max iterations ({self.max_iterations}) without a final answer",
+            )
 
         return current_messages
 
@@ -216,20 +248,30 @@ class AsyncFCInferencer:
                 }
 
                 response = await client.chat.completions.create(**call_params)
+                self.last_error = None
                 return response
             except (APITimeoutError, TimeoutError) as e:
                 logger.error(f"LLM Timeout (attempt {attempt + 1}): {e}")
                 if attempt == self.max_retry - 1:
+                    self.last_error = (
+                        f"LLM request failed after {self.max_retry} attempts: "
+                        f"{type(e).__name__}: {e}"
+                    )
                     return None
                 await asyncio.sleep(self.sleep_interval)
             except Exception as e:
                 if self._is_retryable_error(e):
                     logger.error(f"LLM Error (attempt {attempt + 1}): {e}")
                     if attempt == self.max_retry - 1:
+                        self.last_error = (
+                            f"LLM request failed after {self.max_retry} attempts: "
+                            f"{type(e).__name__}: {e}"
+                        )
                         return None
                     await asyncio.sleep(self.sleep_interval)
                 else:
                     logger.error(f"LLM Fatal Error: {e}")
+                    self.last_error = f"LLM fatal error: {type(e).__name__}: {e}"
                     return None
         return None
 
@@ -284,10 +326,15 @@ class AsyncFCInferencer:
                         result_content, self.max_tool_response_length
                     )
 
+                self.last_error = None
                 return result_content
 
             except Exception as e:
                 logger.error(f"Tool execution error (attempt {attempt + 1}): {e}")
+                self.last_error = (
+                    f"Tool '{tool_name}' failed after {attempt + 1}/{self.max_retry} attempts: "
+                    f"{type(e).__name__}: {e}"
+                )
                 await asyncio.sleep(self.sleep_interval)
 
         return None
