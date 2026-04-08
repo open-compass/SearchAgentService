@@ -6,6 +6,7 @@ executor functions via the registry, without MCP protocol for tool discovery
 or remote calls.
 """
 import json
+import inspect
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
@@ -20,13 +21,20 @@ class ToolRegistry:
         self._executors: Dict[str, Callable] = {}
         # Tool schemas in OpenAI function calling format
         self._schemas: List[Dict[str, Any]] = []
+        self._cleanup_callbacks: List[Callable[[], Any]] = []
 
-    def register(self, schema: Dict[str, Any], executor: Callable):
+    def register(
+        self,
+        schema: Dict[str, Any],
+        executor: Callable,
+        cleanup: Optional[Callable[[], Any]] = None,
+    ):
         """Register a tool.
 
         Args:
             schema: Tool schema in OpenAI function calling format
             executor: Corresponding async executor function
+            cleanup: Optional cleanup callback for request-scoped resources
         """
         name = schema["function"]["name"]
         if name in self._executors:
@@ -34,6 +42,8 @@ class ToolRegistry:
             return
         self._executors[name] = executor
         self._schemas.append(schema)
+        if cleanup is not None:
+            self._cleanup_callbacks.append(cleanup)
         logger.info(f"Registered tool: {name}")
 
     @property
@@ -71,6 +81,13 @@ class ToolRegistry:
             return result
         return json.dumps(result, ensure_ascii=False)
 
+    async def aclose(self) -> None:
+        """Release request-scoped tool resources."""
+        for cleanup in reversed(self._cleanup_callbacks):
+            result = cleanup()
+            if inspect.isawaitable(result):
+                await result
+
 
 DEFAULT_TOOLS = ["search", "visit"]
 
@@ -79,29 +96,32 @@ _TOOL_BUILDERS: Dict[str, Callable] = {}
 
 
 def _register_search(registry: ToolRegistry, config: Dict[str, str]):
-    from tools.search import search, configure as search_configure, TOOL_SCHEMA as SEARCH_SCHEMA
-    search_configure(serper_api_key=config.get("SERPER_API_KEY", ""))
-    registry.register(SEARCH_SCHEMA, search)
+    from tools.search import SearchTool, TOOL_SCHEMA as SEARCH_SCHEMA
+
+    tool = SearchTool(serper_api_key=config.get("SERPER_API_KEY", ""))
+    registry.register(SEARCH_SCHEMA, tool.search, cleanup=tool.close)
 
 
 def _register_browse(registry: ToolRegistry, config: Dict[str, str]):
-    from tools.browse import browse, configure as browse_configure, TOOL_SCHEMA as BROWSE_SCHEMA
-    browse_configure(jina_api_key=config.get("JINA_API_KEY", ""))
-    registry.register(BROWSE_SCHEMA, browse)
+    from tools.browse import BrowseTool, TOOL_SCHEMA as BROWSE_SCHEMA
+
+    tool = BrowseTool(jina_api_key=config.get("JINA_API_KEY", ""))
+    registry.register(BROWSE_SCHEMA, tool.browse, cleanup=tool.close)
 
 
 def _register_visit(registry: ToolRegistry, config: Dict[str, str]):
-    from tools.web_visitor import visit, configure as visit_configure, TOOL_SCHEMA as VISIT_SCHEMA
-    visit_configure(
+    from tools.web_visitor import WebVisitorTool, TOOL_SCHEMA as VISIT_SCHEMA
+
+    tool = WebVisitorTool(
         jina_api_key=config.get("JINA_API_KEY", ""),
         model_name=config.get("MODEL_NAME", ""),
         base_url=config.get("BASE_URL", ""),
-        api_key=config.get("API_KEY", "sk-admin"),
+        api_key=config.get("API_KEY", ""),
         request_timeout=int(config.get("REQUEST_TIMEOUT", "2000")),
         max_retry=int(config.get("MAX_RETRY", "10")),
         retry_interval=int(config.get("RETRY_INTERVAL", "5")),
     )
-    registry.register(VISIT_SCHEMA, visit)
+    registry.register(VISIT_SCHEMA, tool.visit, cleanup=tool.close)
 
 
 _TOOL_BUILDERS["search"] = _register_search

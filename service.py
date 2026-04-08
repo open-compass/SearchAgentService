@@ -11,9 +11,7 @@ Configuration (via AgentCompass):
         REQUEST_TIMEOUT: "600"
         SERPER_API_KEY: "your_serper_key"
         JINA_API_KEY: "your_jina_key"
-        MODEL_NAME: "model_name_for_visit_tool"
-        BASE_URL: "llm_base_url_for_visit_tool"
-        API_KEY: "llm_api_key_for_visit_tool"
+        MODEL_NAME: "optional_tool_model_name"
 """
 
 import logging
@@ -34,6 +32,8 @@ logger = logging.getLogger("SearchAgentService")
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
 
 app = FastAPI(title="SearchAgentService")
+
+_DISALLOWED_TOOL_LLM_ENV_KEYS = {"BASE_URL", "API_KEY"}
 
 
 class TaskRequest(BaseModel):
@@ -74,6 +74,30 @@ def _get_runtime_param(
     return default
 
 
+def _validate_request_config(
+    llm_config: Dict[str, Any],
+    env_params: Dict[str, str],
+) -> Optional[str]:
+    missing = [
+        field for field in ("model_name", "url", "api_key")
+        if not llm_config.get(field)
+    ]
+    if missing:
+        return f"llm_config must contain {', '.join(missing)}"
+
+    forbidden_keys = sorted(
+        key for key in _DISALLOWED_TOOL_LLM_ENV_KEYS
+        if env_params.get(key)
+    )
+    if forbidden_keys:
+        return (
+            "service_env_params may not override tool LLM credentials: "
+            + ", ".join(forbidden_keys)
+        )
+
+    return None
+
+
 @app.post("/api/tasks", response_model=TaskResponse)
 async def run_task(request: TaskRequest):
     """Run agent task (AgentCompass WAIT protocol)."""
@@ -92,11 +116,12 @@ async def run_task(request: TaskRequest):
             error="empty question"
         )
 
-    if not llm_config.get("model_name") or not llm_config.get("url"):
+    config_error = _validate_request_config(llm_config, env_params)
+    if config_error:
         return TaskResponse(
             final_answer="",
             status="failed",
-            error="llm_config must contain model_name and url"
+            error=config_error
         )
 
     model_config = {
@@ -116,12 +141,13 @@ async def run_task(request: TaskRequest):
     logger.info(f"Starting task {task_id}, benchmark: {benchmark}, model: {model_config['model']}")
 
     # Extract tool API keys from service_env_params and build registry
+    registry = None
     tool_config = {
         "SERPER_API_KEY": _get_runtime_param(env_params, "SERPER_API_KEY"),
         "JINA_API_KEY": _get_runtime_param(env_params, "JINA_API_KEY"),
         "MODEL_NAME": _get_runtime_param(env_params, "MODEL_NAME") or llm_config.get("model_name", ""),
-        "BASE_URL": _get_runtime_param(env_params, "BASE_URL") or llm_config.get("url", ""),
-        "API_KEY": _get_runtime_param(env_params, "API_KEY") or llm_config.get("api_key", "sk-admin"),
+        "BASE_URL": llm_config.get("url", ""),
+        "API_KEY": llm_config.get("api_key", ""),
         "REQUEST_TIMEOUT": str(request_timeout),
         "MAX_RETRY": str(max_retry),
         "RETRY_INTERVAL": str(sleep_interval),
@@ -183,6 +209,8 @@ async def run_task(request: TaskRequest):
         )
     finally:
         await inferencer.close()
+        if registry is not None:
+            await registry.aclose()
 
 
 @app.get("/health")

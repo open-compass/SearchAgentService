@@ -40,30 +40,17 @@ IDLE_RESET_TIMEOUT = 20         # Reset client after 20s idle, -1 to disable
 JINA_URL = "https://r.jina.ai/"
 
 # =============================================================================
-# API Key Management (lazy init, injected via configure())
+# API Key Management
 # =============================================================================
 KeyInfo = tuple[str, int]  # (api_key, qps_limit)
-key_list: list[KeyInfo] = []
-key_weights: list[float] = []
-_configured = False
 
 
-def configure(jina_api_key: str):
-    """Initialize API keys, called by registry during build.
-
-    Args:
-        jina_api_key: Jina API key. Supports multi-key format:
-            key1_ratelimit_100,key2_ratelimit_200,key3
-    """
-    global key_list, key_weights, _configured
-
-    if _configured:
-        return
-
+def _parse_jina_keys(jina_api_key: str) -> tuple[list[KeyInfo], list[float]]:
+    """Parse request-scoped Jina API keys and their weighted QPS limits."""
     if not jina_api_key:
         raise RuntimeError("Missing JINA_API_KEY")
 
-    key_list.clear()
+    key_list: list[KeyInfo] = []
     for raw in jina_api_key.split(","):
         raw = raw.strip()
         if not raw:
@@ -80,15 +67,12 @@ def configure(jina_api_key: str):
         raise RuntimeError("JINA_API_KEY parsed as empty")
 
     total_qps = sum(k[1] for k in key_list)
-    key_weights.clear()
-    key_weights.extend([k[1] / total_qps for k in key_list])
-    _configured = True
+    key_weights = [k[1] / total_qps for k in key_list]
+    return key_list, key_weights
 
 
-def get_api_key() -> str:
-    """Select API key randomly by QPS weight."""
-    if not _configured:
-        raise RuntimeError("browse tool not initialized, call configure() first")
+def _select_api_key(key_list: list[KeyInfo], key_weights: list[float]) -> str:
+    """Select an API key randomly by QPS weight."""
     idx = random.choices(range(len(key_list)), weights=key_weights, k=1)[0]
     return key_list[idx][0]
 
@@ -155,8 +139,6 @@ class HTTPClientManager:
     @staticmethod
     def _now() -> str:
         return datetime.now().strftime("%H:%M:%S")
-
-client_manager = HTTPClientManager()
 
 # =============================================================================
 # Metrics Collection
@@ -279,13 +261,12 @@ class Metrics:
                 "idle_time": idle_time,
             }
 
-metrics = Metrics()
-
 # =============================================================================
 # Circuit Breaker
 # =============================================================================
 class CircuitBreaker:
-    def __init__(self):
+    def __init__(self, client_manager: HTTPClientManager):
+        self.client_manager = client_manager
         self.is_open = False
         self.open_time = 0.0
         self.min_interval = 60.0  # Min circuit break interval, should exceed stats window
@@ -304,7 +285,7 @@ class CircuitBreaker:
                 stats["error_rate"] >= CIRCUIT_BREAK_ERROR_RATE):
                 self.is_open = True
                 self.open_time = now
-                did_reset = await client_manager.reset_session(wait=0.1, min_interval=self.min_interval, reason="circuit_breaker")
+                did_reset = await self.client_manager.reset_session(wait=0.1, min_interval=self.min_interval, reason="circuit_breaker")
                 if not did_reset:
                     print(f"[{self._now()}] Circuit break reset skipped (already reset within {self.min_interval}s)")
                 else:
@@ -318,13 +299,14 @@ class CircuitBreaker:
     @staticmethod
     def _now() -> str:
         return datetime.now().strftime("%H:%M:%S")
-
-circuit_breaker = CircuitBreaker()
-
 # =============================================================================
 # Health Check Loop
 # =============================================================================
-async def health_check_loop():
+async def health_check_loop(
+    metrics: Metrics,
+    client_manager: HTTPClientManager,
+    circuit_breaker: CircuitBreaker,
+):
     """Background health check."""
     while True:
         await asyncio.sleep(HEALTH_CHECK_INTERVAL)
@@ -366,7 +348,14 @@ async def health_check_loop():
 # =============================================================================
 # Core Function (aiohttp)
 # =============================================================================
-async def do_browse(url: str) -> Dict[str, Any]:
+async def do_browse(
+    url: str,
+    *,
+    key_list: list[KeyInfo],
+    key_weights: list[float],
+    client_manager: HTTPClientManager,
+    circuit_breaker: CircuitBreaker,
+) -> Dict[str, Any]:
     """Execute browse with retries."""
     deadline = time.time() + PER_REQUEST_TIMEOUT
     last_error = None
@@ -374,7 +363,7 @@ async def do_browse(url: str) -> Dict[str, Any]:
     sleep_between_retries = 5
 
     for attempt in range(max_attempts):
-        random_key = get_api_key()
+        random_key = _select_api_key(key_list, key_weights)
 
         if attempt > 0:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Retry attempt={attempt+1} for url={url}")
@@ -437,12 +426,18 @@ async def do_browse(url: str) -> Dict[str, Any]:
     raise RuntimeError(f"Crawl failed: {type(last_error).__name__}: {last_error}")
 
 # =============================================================================
-# Concurrency Control
+# Request-scoped tool wrapper
 # =============================================================================
-semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-
-
-async def browse(url: str) -> Dict[str, Any]:
+async def run_browse(
+    url: str,
+    *,
+    key_list: list[KeyInfo],
+    key_weights: list[float],
+    client_manager: HTTPClientManager,
+    metrics: Metrics,
+    circuit_breaker: CircuitBreaker,
+    semaphore: asyncio.Semaphore,
+) -> Dict[str, Any]:
     """Crawl the content of a specified URL, including the title, summary, and detailed content."""
     start_time = await metrics.request_start()
     success = False
@@ -452,7 +447,13 @@ async def browse(url: str) -> Dict[str, Any]:
             await metrics.tool_enter(start_time)
             try:
                 result = await asyncio.wait_for(
-                    do_browse(url),
+                    do_browse(
+                        url,
+                        key_list=key_list,
+                        key_weights=key_weights,
+                        client_manager=client_manager,
+                        circuit_breaker=circuit_breaker,
+                    ),
                     timeout=PER_REQUEST_TIMEOUT
                 )
                 success = True
@@ -473,6 +474,35 @@ async def browse(url: str) -> Dict[str, Any]:
                 await metrics.tool_exit()
     finally:
         await metrics.request_end(success=success)
+
+
+class BrowseTool:
+    """Request-scoped browse tool with isolated API keys and client state."""
+
+    def __init__(self, jina_api_key: str):
+        self.key_list, self.key_weights = _parse_jina_keys(jina_api_key)
+        self.client_manager = HTTPClientManager()
+        self.metrics = Metrics()
+        self.circuit_breaker = CircuitBreaker(self.client_manager)
+        self.semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async def browse(self, url: str) -> Dict[str, Any]:
+        return await run_browse(
+            url,
+            key_list=self.key_list,
+            key_weights=self.key_weights,
+            client_manager=self.client_manager,
+            metrics=self.metrics,
+            circuit_breaker=self.circuit_breaker,
+            semaphore=self.semaphore,
+        )
+
+    async def close(self) -> None:
+        await self.client_manager.reset_session(
+            wait=0.0,
+            min_interval=0.0,
+            reason="cleanup",
+        )
 
 
 # Tool schema (for registry, compatible with original MCP tool schema)
