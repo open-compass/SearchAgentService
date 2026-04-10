@@ -3,17 +3,28 @@ Async Function Call Inferencer with direct tool calling.
 """
 
 import asyncio
+import ast
 import json
 import logging
 import os
 import random
 import re
+import time
 from typing import List, Literal, Optional, TypedDict, Union
 
 import httpx
-from openai import APITimeoutError, AsyncOpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    RateLimitError,
+)
 from pydantic import BaseModel, Field
 
+from llm_streaming import collect_openai_chat_stream, is_streaming_unsupported_error
 from tools.registry import ToolRegistry, build_default_registry
 
 logging.basicConfig(level=logging.INFO)
@@ -119,6 +130,7 @@ class AsyncFCInferencer:
         sleep_interval: Optional[int] = None,
         max_tool_response_length: Optional[int] = None,
         max_tool_calls_per_turn: Optional[int] = None,
+        task_id: Optional[str] = None,
     ):
         base_urls = model['base_url'] if isinstance(model['base_url'], list) else [model['base_url']]
 
@@ -127,7 +139,19 @@ class AsyncFCInferencer:
         max_keepalive = int(os.getenv("MAX_KEEPALIVE_CONNECTIONS", "20"))
         keepalive_expiry = float(os.getenv("KEEPALIVE_EXPIRY", "10.0"))
         http_timeout = float(os.getenv("HTTP_TIMEOUT", os.getenv("TIMEOUT", "60.0")))
-        request_timeout = float(os.getenv("REQUEST_TIMEOUT", "2000.0"))
+        request_timeout = (
+            float(timeout)
+            if timeout is not None
+            else float(os.getenv("REQUEST_TIMEOUT", "2000.0"))
+        )
+        self.timeout = request_timeout
+        self._started_at = time.monotonic()
+        self._deadline_at = (
+            self._started_at + request_timeout
+            if request_timeout and request_timeout > 0
+            else None
+        )
+        io_timeout = min(http_timeout, request_timeout) if request_timeout > 0 else http_timeout
 
         self.http_client = httpx.AsyncClient(
             limits=httpx.Limits(
@@ -136,10 +160,10 @@ class AsyncFCInferencer:
                 keepalive_expiry=keepalive_expiry
             ),
             timeout=httpx.Timeout(
-                connect=http_timeout,
+                connect=io_timeout,
                 read=request_timeout,
-                write=http_timeout,
-                pool=http_timeout
+                write=io_timeout,
+                pool=io_timeout
             )
         )
 
@@ -156,38 +180,160 @@ class AsyncFCInferencer:
         self.model_name = model["model"]
         self.model_infer_params = model_infer_params or {}
         self.max_iterations = max_iterations or int(os.getenv("MAX_ITERATIONS", "50"))
-        self.timeout = timeout or int(os.getenv("REQUEST_TIMEOUT", "2000"))
         self.max_retry = max_retry or int(os.getenv("MAX_RETRY", "25"))
         self.sleep_interval = sleep_interval or int(os.getenv("RETRY_INTERVAL", "5"))
         self.max_tool_response_length = max_tool_response_length or int(os.getenv("MAX_TOOL_RESPONSE_LENGTH", "8192"))
         self.max_tool_calls_per_turn = max_tool_calls_per_turn or int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "5"))
+        self.enable_llm_streaming = os.getenv("ENABLE_LLM_STREAMING", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self.task_id = str(task_id or "unknown")
+        self._streaming_mode_logged = False
+        self._streaming_fallback_logged = False
 
         self.registry = registry or build_default_registry()
-        self.last_stop_reason: Optional[str] = None
         self.last_error: Optional[str] = None
+        self.last_retryable: Optional[bool] = None
 
-    def _set_stop_state(self, reason: str, error: Optional[str] = None) -> None:
-        """Record why inference stopped so the service can surface failures."""
-        self.last_stop_reason = reason
+    def _set_failure_state(self, error: Optional[str], *, retryable: bool) -> None:
+        """Record the current terminal failure state for the request."""
         if error not in (None, ""):
             self.last_error = error
+        self.last_retryable = retryable
+
+    def _clear_failure_state(self) -> None:
+        """Reset terminal failure state after a successful step."""
+        self.last_error = None
+        self.last_retryable = None
+
+    @staticmethod
+    def _extract_status_code(exc: Exception) -> Optional[int]:
+        """Best-effort extract an HTTP status code from provider/transport exceptions."""
+        for attr in ("status_code", "status"):
+            value = getattr(exc, attr, None)
+            if isinstance(value, int):
+                return value
+
+        response = getattr(exc, "response", None)
+        if response is not None:
+            for attr in ("status_code", "status"):
+                value = getattr(response, attr, None)
+                if isinstance(value, int):
+                    return value
+        return None
+
+    @classmethod
+    def _is_non_retryable_llm_exception(cls, exc: Exception) -> bool:
+        """Return True for prompt/auth/configuration errors that should not be retried."""
+        if isinstance(exc, (AuthenticationError, BadRequestError)):
+            return True
+
+        status_code = cls._extract_status_code(exc)
+        if isinstance(status_code, int):
+            return status_code in {400, 401, 403, 404, 422}
+
+        error_text = f"{type(exc).__name__}: {exc}".lower()
+        return (
+            "authentication" in error_text
+            or "invalid task gateway token" in error_text
+            or "invalid token" in error_text
+        )
+
+    def _remaining_budget(self) -> Optional[float]:
+        """Return the remaining request budget in seconds, if bounded."""
+        if self._deadline_at is None:
+            return None
+        return self._deadline_at - time.monotonic()
+
+    def _mark_deadline_exceeded(self, context: str) -> None:
+        """Record deadline exhaustion with contextual detail."""
+        detail = "Request deadline exceeded"
+        if context:
+            detail = f"{detail} while {context}"
+        self._set_failure_state(detail, retryable=False)
+
+    def _ensure_time_remaining(self, context: str, *, min_remaining: float = 1.0) -> bool:
+        """Return False and record a stop reason when no useful time budget remains."""
+        remaining = self._remaining_budget()
+        if remaining is not None and remaining <= min_remaining:
+            self._mark_deadline_exceeded(context)
+            return False
+        return True
+
+    def _effective_call_timeout(self, context: str) -> Optional[float]:
+        """Clamp each model call to the remaining end-to-end request budget."""
+        remaining = self._remaining_budget()
+        if remaining is None:
+            return self.timeout
+        effective_timeout = min(float(self.timeout), remaining)
+        if effective_timeout <= 1.0:
+            self._mark_deadline_exceeded(context)
+            return None
+        return effective_timeout
+
+    async def _sleep_before_retry(self, context: str) -> bool:
+        """Sleep before retrying, but never beyond the remaining request budget."""
+        remaining = self._remaining_budget()
+        if remaining is None:
+            await asyncio.sleep(self.sleep_interval)
+            return True
+
+        sleep_for = min(float(self.sleep_interval), max(0.0, remaining - 1.0))
+        if sleep_for <= 0:
+            self._mark_deadline_exceeded(context)
+            return False
+        await asyncio.sleep(sleep_for)
+        return True
+
+    async def _handle_retryable_llm_error(self, exc: Exception, attempt: int) -> bool:
+        """Handle one retryable LLM error. Returns True when the caller should retry."""
+        logger.error(
+            "LLM retryable error (attempt %d/%d): %s: %s",
+            attempt + 1,
+            self.max_retry,
+            type(exc).__name__,
+            exc,
+        )
+        if attempt == self.max_retry - 1:
+            self._set_failure_state(
+                (
+                    f"LLM request failed after {self.max_retry} attempts: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                retryable=True,
+            )
+            if not self._ensure_time_remaining(
+                f"handling exhausted retries for LLM attempt {attempt + 1}",
+                min_remaining=0.0,
+            ):
+                return False
+            return False
+        if not await self._sleep_before_retry(
+            f"waiting to retry LLM attempt {attempt + 2}/{self.max_retry}"
+        ):
+            return False
+        return True
 
     async def infer(self, messages: List[ChatMessage]) -> List[dict]:
         """Run inference with tool calling loop."""
-        self.last_stop_reason = None
-        self.last_error = None
+        self._clear_failure_state()
         current_messages = [m.model_dump(exclude_none=True) for m in messages]
         tools_schema = self.registry.schemas
 
         for iteration in range(1, self.max_iterations + 1):
+            if not self._ensure_time_remaining(f"starting iteration {iteration}"):
+                break
+
             logger.info(f"Iteration {iteration}/{self.max_iterations}")
 
             response = await self._call_llm(current_messages, tools_schema)
             if response is None:
-                if self.last_stop_reason is None:
-                    self._set_stop_state(
-                        "llm_request_failed",
-                        self.last_error or f"LLM request failed after {self.max_retry} attempts",
+                if self.last_error is None:
+                    self._set_failure_state(
+                        f"LLM request failed after {self.max_retry} attempts",
+                        retryable=True,
                     )
                 break
 
@@ -199,7 +345,7 @@ class AsyncFCInferencer:
             current_messages.append(assistant_msg)
 
             if not message_data.tool_calls:
-                self._set_stop_state("completed")
+                self._clear_failure_state()
                 break
 
             if len(message_data.tool_calls) > self.max_tool_calls_per_turn:
@@ -209,25 +355,22 @@ class AsyncFCInferencer:
                     f"exceeding limit {self.max_tool_calls_per_turn}"
                 )
                 logger.warning(f"Too many tool calls: {tool_call_count}")
-                self._set_stop_state("too_many_tool_calls", error)
+                self._set_failure_state(error, retryable=False)
                 break
 
             logger.info(f"Tools called: {[tc.function.name for tc in message_data.tool_calls]}")
 
             tool_results = await self._execute_tool_calls(message_data.tool_calls)
             if tool_results is None:
-                if self.last_stop_reason is None:
-                    self._set_stop_state(
-                        "tool_execution_failed",
-                        self.last_error or "Tool execution failed",
-                    )
+                if self.last_error is None:
+                    self._set_failure_state("Tool execution failed", retryable=True)
                 break
 
             current_messages.extend(tool_results)
         else:
-            self._set_stop_state(
-                "max_iterations_exceeded",
+            self._set_failure_state(
                 f"Reached max iterations ({self.max_iterations}) without a final answer",
+                retryable=False,
             )
 
         return current_messages
@@ -235,53 +378,208 @@ class AsyncFCInferencer:
     async def _call_llm(self, messages: List[dict], tools_schema: list):
         """Call LLM with retry logic."""
         for attempt in range(self.max_retry):
+            call_timeout = self._effective_call_timeout(
+                f"starting LLM attempt {attempt + 1}/{self.max_retry}"
+            )
+            if call_timeout is None:
+                return None
+
             try:
                 client = random.choice(self.clients)
 
-                call_params = {
-                    "model": self.model_name,
-                    "messages": messages,
-                    "tools": tools_schema if tools_schema else None,
-                    "stream": False,
-                    "timeout": self.timeout,
-                    **self.model_infer_params
-                }
-
-                response = await client.chat.completions.create(**call_params)
-                self.last_error = None
+                response = await self._request_completion(
+                    client,
+                    messages=messages,
+                    tools_schema=tools_schema,
+                    stream=self.enable_llm_streaming,
+                    timeout=call_timeout,
+                )
+                self._clear_failure_state()
                 return response
-            except (APITimeoutError, TimeoutError) as e:
-                logger.error(f"LLM Timeout (attempt {attempt + 1}): {e}")
-                if attempt == self.max_retry - 1:
-                    self.last_error = (
-                        f"LLM request failed after {self.max_retry} attempts: "
-                        f"{type(e).__name__}: {e}"
+            except (
+                APITimeoutError,
+                TimeoutError,
+                APIConnectionError,
+                RateLimitError,
+                InternalServerError,
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+            ) as e:
+                if not await self._handle_retryable_llm_error(e, attempt):
+                    return None
+            except AuthenticationError as e:
+                logger.error("LLM non-retryable authentication error: %s", e)
+                self._set_failure_state(
+                    f"LLM authentication failed: {type(e).__name__}: {e}",
+                    retryable=False,
+                )
+                return None
+            except BadRequestError as e:
+                logger.error("LLM non-retryable bad request: %s", e)
+                self._set_failure_state(
+                    f"LLM bad request: {type(e).__name__}: {e}",
+                    retryable=False,
+                )
+                return None
+            except Exception as e:
+                status_code = self._extract_status_code(e)
+                if self._is_non_retryable_llm_exception(e):
+                    logger.error("LLM non-retryable error: %s: %s", type(e).__name__, e)
+                    self._set_failure_state(
+                        f"LLM request failed: {type(e).__name__}: {e}",
+                        retryable=False,
                     )
                     return None
-                await asyncio.sleep(self.sleep_interval)
-            except Exception as e:
-                if self._is_retryable_error(e):
-                    logger.error(f"LLM Error (attempt {attempt + 1}): {e}")
-                    if attempt == self.max_retry - 1:
-                        self.last_error = (
-                            f"LLM request failed after {self.max_retry} attempts: "
-                            f"{type(e).__name__}: {e}"
-                        )
+                if status_code == 429 or (isinstance(status_code, int) and status_code >= 500):
+                    if not await self._handle_retryable_llm_error(e, attempt):
                         return None
-                    await asyncio.sleep(self.sleep_interval)
-                else:
-                    logger.error(f"LLM Fatal Error: {e}")
-                    self.last_error = f"LLM fatal error: {type(e).__name__}: {e}"
+                    continue
+
+                logger.error("LLM unknown error treated as retryable: %s: %s", type(e).__name__, e)
+                if not await self._handle_retryable_llm_error(e, attempt):
                     return None
         return None
 
-    def _is_retryable_error(self, e: Exception) -> bool:
-        """Check if error is retryable."""
-        retryable_patterns = [
-            "TimeoutError", "litellm.BadRequestError", "litellm.APIError"
-        ]
-        error_str = str(e)
-        return any(p in error_str for p in retryable_patterns)
+    def _build_call_params(
+        self,
+        messages: List[dict],
+        tools_schema: list,
+        *,
+        stream: bool,
+        timeout: float,
+    ) -> dict:
+        """Build chat-completions parameters for either stream or non-stream mode."""
+        infer_params = dict(self.model_infer_params or {})
+        infer_params.pop("stream", None)
+        stream_options = infer_params.pop("stream_options", None)
+
+        call_params = {
+            "model": self.model_name,
+            "messages": messages,
+            "tools": tools_schema if tools_schema else None,
+            "stream": stream,
+            "timeout": timeout,
+            **infer_params,
+        }
+        if stream:
+            call_params["stream_options"] = stream_options or {"include_usage": True}
+        return call_params
+
+    async def _request_completion(
+        self,
+        client: AsyncOpenAI,
+        *,
+        messages: List[dict],
+        tools_schema: list,
+        stream: bool,
+        timeout: float,
+    ):
+        """Request one chat completion, aggregating stream chunks when enabled."""
+        call_params = self._build_call_params(
+            messages,
+            tools_schema,
+            stream=stream,
+            timeout=timeout,
+        )
+
+        if not self._streaming_mode_logged:
+            if stream:
+                logger.info(
+                    "Task %s LLM streaming enabled for main inferencer (model=%s)",
+                    self.task_id,
+                    self.model_name,
+                )
+            else:
+                logger.info(
+                    "Task %s LLM streaming disabled for main inferencer (model=%s)",
+                    self.task_id,
+                    self.model_name,
+                )
+            self._streaming_mode_logged = True
+
+        if stream:
+            try:
+                stream_resp = await client.chat.completions.create(**call_params)
+                return await collect_openai_chat_stream(stream_resp, model_name=self.model_name)
+            except Exception as exc:
+                if is_streaming_unsupported_error(exc):
+                    if not self._streaming_fallback_logged:
+                        logger.warning(
+                            "Task %s LLM fallback to non-stream for main inferencer (model=%s): upstream rejected streaming",
+                            self.task_id,
+                            self.model_name,
+                        )
+                        self._streaming_fallback_logged = True
+                    return await self._request_completion(
+                        client,
+                        messages=messages,
+                        tools_schema=tools_schema,
+                        stream=False,
+                        timeout=timeout,
+                    )
+                raise
+
+        return await client.chat.completions.create(**call_params)
+
+    def _strip_code_fences(self, text: str) -> str:
+        """Remove surrounding Markdown code fences from tool arguments."""
+        stripped = text.strip()
+        if not stripped.startswith("```"):
+            return stripped
+
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+
+    def _parse_tool_arguments(self, args_str: str) -> dict:
+        """Parse tool-call arguments with a strict-JSON first strategy.
+
+        Models occasionally emit Python-style dicts or fenced JSON. We accept a
+        small compatibility envelope here because the tool schema is already
+        known and execution remains local.
+        """
+        candidate = self._strip_code_fences(str(args_str))
+        candidate = (
+            candidate
+            .replace("“", '"')
+            .replace("”", '"')
+            .replace("‘", "'")
+            .replace("’", "'")
+        )
+
+        for _ in range(3):
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                break
+
+            if isinstance(parsed, dict):
+                return parsed
+            if isinstance(parsed, str):
+                candidate = self._strip_code_fences(parsed)
+                continue
+            raise TypeError(
+                f"Tool arguments must decode to an object, got {type(parsed).__name__}"
+            )
+
+        try:
+            parsed = ast.literal_eval(candidate)
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid tool arguments: {candidate[:200]!r}"
+            ) from exc
+
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, str):
+            return self._parse_tool_arguments(parsed)
+        raise TypeError(
+            f"Tool arguments must decode to an object, got {type(parsed).__name__}"
+        )
 
     async def _execute_tool_calls(self, tool_calls) -> Optional[List[dict]]:
         """Execute tool calls and return results."""
@@ -291,6 +589,9 @@ class AsyncFCInferencer:
             tool_name = tool_call.function.name
             args_str = tool_call.function.arguments
             call_id = tool_call.id
+
+            if not self._ensure_time_remaining(f"executing tool '{tool_name}'"):
+                return None
 
             result_content = await self._execute_single_tool(tool_name, args_str)
             if result_content is None:
@@ -309,14 +610,32 @@ class AsyncFCInferencer:
         """Execute a single tool call via registry (direct function call)."""
         if not self.registry.has_tool(tool_name):
             logger.error(f"Tool not found: {tool_name}")
+            self._set_failure_state(f"Tool not found: {tool_name}", retryable=False)
+            return None
+
+        try:
+            args = self._parse_tool_arguments(args_str)
+        except Exception as e:
+            logger.error(
+                "Invalid tool arguments for %s: %s. Raw arguments preview: %r",
+                tool_name,
+                e,
+                str(args_str)[:200],
+            )
+            self._set_failure_state(
+                f"Invalid tool arguments for '{tool_name}': "
+                f"{type(e).__name__}: {e}",
+                retryable=False,
+            )
             return None
 
         for attempt in range(self.max_retry):
-            try:
-                args = json.loads(args_str)
-                if isinstance(args, str):
-                    args = json.loads(args)
+            if not self._ensure_time_remaining(
+                f"starting tool '{tool_name}' attempt {attempt + 1}/{self.max_retry}"
+            ):
+                return None
 
+            try:
                 logger.info(f"Executing {tool_name} with args: {str(args)[:200]}")
 
                 result_content = await self.registry.execute(tool_name, args)
@@ -326,16 +645,22 @@ class AsyncFCInferencer:
                         result_content, self.max_tool_response_length
                     )
 
-                self.last_error = None
+                self._clear_failure_state()
                 return result_content
 
             except Exception as e:
                 logger.error(f"Tool execution error (attempt {attempt + 1}): {e}")
-                self.last_error = (
+                self._set_failure_state(
                     f"Tool '{tool_name}' failed after {attempt + 1}/{self.max_retry} attempts: "
-                    f"{type(e).__name__}: {e}"
+                    f"{type(e).__name__}: {e}",
+                    retryable=True,
                 )
-                await asyncio.sleep(self.sleep_interval)
+                if attempt == self.max_retry - 1:
+                    return None
+                if not await self._sleep_before_retry(
+                    f"waiting to retry tool '{tool_name}' attempt {attempt + 2}/{self.max_retry}"
+                ):
+                    return None
 
         return None
 

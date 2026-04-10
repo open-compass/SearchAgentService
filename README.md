@@ -104,6 +104,12 @@ Resolution priority:
 2. Process environment variables or `./.env`
 3. Code defaults
 
+For request budget specifically, SearchAgentService resolves timeout in this order:
+
+1. `llm_config.request_timeout` forwarded by AgentCompass from `benchmark_params.request_timeout`
+2. process env `REQUEST_TIMEOUT` or `./.env` for local standalone runs
+3. code default
+
 ### Environment Variables
 
 SearchAgentService has two configuration paths for environment variables:
@@ -131,6 +137,8 @@ These are not read from `service_env_params` in the current implementation.
 | HOST | Service bind host | 0.0.0.0 |
 | PORT | Service port | 8083 |
 | WORKERS | Uvicorn worker count | 1 |
+| TIMEOUT_KEEP_ALIVE | Uvicorn idle keep-alive timeout in seconds | 5 |
+| REQUEST_TIMEOUT | Per-task internal timeout override for standalone local runs | 2000 |
 | HTTP_TIMEOUT | Low-level HTTP connect/write/pool timeout | 300 |
 | MAX_TOOL_CALLS_PER_TURN | Maximum tool calls per turn | 5 |
 | MAX_TOOL_RESPONSE_LENGTH | Maximum tool response length before truncation | 8192 |
@@ -142,7 +150,8 @@ These are not read from `service_env_params` in the current implementation.
 
 Notes:
 - AgentCompass `benchmark_params.request_timeout` controls how long AgentCompass waits for the HTTP response from SearchAgentService.
-- `REQUEST_TIMEOUT` still exists in `SearchAgentService/.env.example` as a local internal timeout setting for SearchAgentService itself, but it is not part of the documented user-facing `service_env_params` contract.
+- For AgentCompass requests, SearchAgentService uses `llm_config.request_timeout`, which AgentCompass forwards from `benchmark_params.request_timeout`, as its internal per-task timeout.
+- `REQUEST_TIMEOUT` is only a local process-env override for standalone runs and is no longer read from `service_env_params`.
 
 ## API
 
@@ -193,9 +202,24 @@ Response:
   "final_answer": "The final answer",
   "trajectory": [{"role": "...", "content": "..."}],
   "status": "completed",
-  "error": null
+  "error": null,
+  "retryable": null
 }
 ```
+
+For failed requests, the service may return explicit failure semantics such as:
+
+```json
+{
+  "final_answer": "",
+  "trajectory": [{"role": "...", "content": "..."}],
+  "status": "failed",
+  "error": "Reached max iterations (50) without a final answer",
+  "retryable": false
+}
+```
+
+`retryable` is the generic contract consumed by AgentCompass when deciding whether a failed sample should be persisted as `_error_*.json` and rerun on resume. `SearchAgentService` no longer returns a separate `stop_reason` field.
 
 ### GET /health
 

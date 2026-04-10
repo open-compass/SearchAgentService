@@ -6,14 +6,19 @@ Reference: https://github.com/Alibaba-NLP/DeepResearch/blob/main/inference/tool_
 """
 import asyncio
 import json
+import logging
 import os
 import random
 import time
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import aiohttp
 import httpx
 from openai import APITimeoutError, AsyncOpenAI
+
+from llm_streaming import collect_openai_chat_stream, is_streaming_unsupported_error
+
+logger = logging.getLogger("WebVisitorTool")
 
 # Web fetching config
 JINA_URL = "https://r.jina.ai/"
@@ -123,6 +128,7 @@ class LLMClient:
         timeout: int,
         max_retry: int,
         sleep_interval: int,
+        task_id: str = "unknown",
     ):
         urls = [u.strip() for u in base_url.split(",") if u.strip()]
         if not urls:
@@ -132,6 +138,14 @@ class LLMClient:
         self.max_retry = max_retry
         self.sleep_interval = sleep_interval
         self.timeout = timeout
+        self.task_id = str(task_id or "unknown")
+        self.enable_llm_streaming = os.getenv("ENABLE_LLM_STREAMING", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self._streaming_mode_logged = False
+        self._streaming_fallback_logged = False
         self.http_client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
         self.clients = [
             AsyncOpenAI(api_key=api_key, base_url=u, http_client=self.http_client)
@@ -142,13 +156,7 @@ class LLMClient:
         for attempt in range(self.max_retry):
             try:
                 client = random.choice(self.clients)
-                resp = await client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    stream=False,
-                    temperature=0.7,
-                    timeout=self.timeout,
-                )
+                resp = await self._request_completion(client, messages=messages, stream=self.enable_llm_streaming)
                 return resp.choices[0].message.content or ""
             except (APITimeoutError, TimeoutError) as e:
                 print(f"[LLM] timeout attempt {attempt + 1}: {e}")
@@ -161,6 +169,48 @@ class LLMClient:
                     return ""
                 await asyncio.sleep(self.sleep_interval)
         return ""
+
+    async def _request_completion(self, client: AsyncOpenAI, *, messages: list[dict], stream: bool):
+        """Issue a chat completion request and aggregate streaming chunks if enabled."""
+        call_params = {
+            "model": self.model_name,
+            "messages": messages,
+            "stream": stream,
+            "temperature": 0.7,
+            "timeout": self.timeout,
+        }
+        if not self._streaming_mode_logged:
+            if stream:
+                logger.info(
+                    "Task %s LLM streaming enabled for web_visitor (model=%s)",
+                    self.task_id,
+                    self.model_name,
+                )
+            else:
+                logger.info(
+                    "Task %s LLM streaming disabled for web_visitor (model=%s)",
+                    self.task_id,
+                    self.model_name,
+                )
+            self._streaming_mode_logged = True
+        if stream:
+            call_params["stream_options"] = {"include_usage": True}
+            try:
+                stream_resp = await client.chat.completions.create(**call_params)
+                return await collect_openai_chat_stream(stream_resp, model_name=self.model_name)
+            except Exception as exc:
+                if is_streaming_unsupported_error(exc):
+                    if not self._streaming_fallback_logged:
+                        logger.warning(
+                            "Task %s LLM fallback to non-stream for web_visitor (model=%s): upstream rejected streaming",
+                            self.task_id,
+                            self.model_name,
+                        )
+                        self._streaming_fallback_logged = True
+                    return await self._request_completion(client, messages=messages, stream=False)
+                raise
+
+        return await client.chat.completions.create(**call_params)
 
     async def close(self) -> None:
         await self.http_client.aclose()
@@ -237,20 +287,6 @@ async def visit_single_url(
         return FAILED_MSG_TEMPLATE.format(url=url, goal=goal)
     return await extract_page_info(url, goal, content, llm)
 
-# =============================================================================
-# Shared fetch session
-# =============================================================================
-http_session: aiohttp.ClientSession = None
-
-
-async def get_session() -> aiohttp.ClientSession:
-    """Lazy-initialize aiohttp session."""
-    global http_session
-    if http_session is None or http_session.closed:
-        http_session = aiohttp.ClientSession()
-    return http_session
-
-
 class WebVisitorTool:
     """Request-scoped web visitor tool with isolated LLM client state."""
 
@@ -261,6 +297,7 @@ class WebVisitorTool:
         model_name: str = "",
         base_url: str = "",
         api_key: str = "",
+        task_id: str = "unknown",
         request_timeout: int = 2000,
         max_retry: int = 10,
         retry_interval: int = 5,
@@ -280,14 +317,24 @@ class WebVisitorTool:
             model_name=model_name,
             base_url=base_url,
             api_key=api_key,
+            task_id=task_id,
             timeout=self.llm_timeout,
             max_retry=max(1, int(max_retry)),
             sleep_interval=max(0, int(retry_interval)),
         )
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create the request-scoped fetch session."""
+        async with self._session_lock:
+            if self._http_session is None or self._http_session.closed:
+                self._http_session = aiohttp.ClientSession()
+            return self._http_session
 
     async def visit(self, url: Union[str, List[str]], goal: str) -> str:
         """Visit webpage(s) and return the summary of the content."""
-        session = await get_session()
+        session = await self._get_session()
 
         if isinstance(url, str):
             try:
@@ -322,7 +369,16 @@ class WebVisitorTool:
         return "\n=======\n".join(results)
 
     async def close(self) -> None:
-        await self.llm.close()
+        session = None
+        async with self._session_lock:
+            session = self._http_session
+            self._http_session = None
+
+        try:
+            if session is not None and not session.closed:
+                await session.close()
+        finally:
+            await self.llm.close()
 
 
 # Tool schema (for registry, compatible with original MCP tool schema)

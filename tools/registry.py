@@ -117,6 +117,7 @@ def _register_visit(registry: ToolRegistry, config: Dict[str, str]):
         model_name=config.get("MODEL_NAME", ""),
         base_url=config.get("BASE_URL", ""),
         api_key=config.get("API_KEY", ""),
+        task_id=config.get("TASK_ID", "unknown"),
         request_timeout=int(config.get("REQUEST_TIMEOUT", "2000")),
         max_retry=int(config.get("MAX_RETRY", "10")),
         retry_interval=int(config.get("RETRY_INTERVAL", "5")),

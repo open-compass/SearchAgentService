@@ -8,18 +8,19 @@ Configuration (via AgentCompass):
     service_url: "http://localhost:8083/api/tasks"
     service_env_params:
         MAX_ITERATIONS: "50"
-        REQUEST_TIMEOUT: "600"
         SERPER_API_KEY: "your_serper_key"
         JINA_API_KEY: "your_jina_key"
         MODEL_NAME: "optional_tool_model_name"
 """
 
+import asyncio
 import logging
 import os
+from contextlib import suppress
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
@@ -51,6 +52,7 @@ class TaskResponse(BaseModel):
     trajectory: Optional[List[Dict]] = None
     status: str = "completed"
     error: Optional[str] = None
+    retryable: Optional[bool] = None
 
 
 def _get_runtime_param(
@@ -70,6 +72,37 @@ def _get_runtime_param(
         value = os.getenv(candidate)
         if value is not None:
             return value
+
+    return default
+
+
+def _parse_positive_timeout_seconds(value: Any, default: int) -> int:
+    """Parse a timeout value in seconds, falling back to default on invalid input."""
+    try:
+        parsed = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _resolve_request_timeout(
+    llm_config: Dict[str, Any],
+    default: int = 2000,
+) -> int:
+    """Resolve the SearchAgentService request budget.
+
+    Priority:
+    1. llm_config.request_timeout forwarded by AgentCompass from benchmark_params.request_timeout
+    2. Process env REQUEST_TIMEOUT / .env for local standalone runs
+    3. Code default
+    """
+    llm_request_timeout = llm_config.get("request_timeout")
+    if llm_request_timeout not in (None, ""):
+        return _parse_positive_timeout_seconds(llm_request_timeout, default)
+
+    env_request_timeout = os.getenv("REQUEST_TIMEOUT")
+    if env_request_timeout is not None:
+        return _parse_positive_timeout_seconds(env_request_timeout, default)
 
     return default
 
@@ -98,8 +131,15 @@ def _validate_request_config(
     return None
 
 
-@app.post("/api/tasks", response_model=TaskResponse)
-async def run_task(request: TaskRequest):
+async def _wait_for_client_disconnect(client_request: Request, poll_interval: float = 0.5) -> bool:
+    """Poll the ASGI request for client disconnects so stale work can be cancelled."""
+    while True:
+        if await client_request.is_disconnected():
+            return True
+        await asyncio.sleep(poll_interval)
+
+
+async def _run_task_impl(request: TaskRequest, client_request: Request | None = None):
     """Run agent task (AgentCompass WAIT protocol)."""
     payload = request.model_dump()
 
@@ -113,7 +153,8 @@ async def run_task(request: TaskRequest):
         return TaskResponse(
             final_answer="",
             status="failed",
-            error="empty question"
+            error="empty question",
+            retryable=False,
         )
 
     config_error = _validate_request_config(llm_config, env_params)
@@ -121,7 +162,8 @@ async def run_task(request: TaskRequest):
         return TaskResponse(
             final_answer="",
             status="failed",
-            error=config_error
+            error=config_error,
+            retryable=False,
         )
 
     model_config = {
@@ -133,7 +175,7 @@ async def run_task(request: TaskRequest):
     model_infer_params = llm_config.get("model_infer_params", {}) or {}
 
     max_iterations = int(_get_runtime_param(env_params, "MAX_ITERATIONS", "50"))
-    request_timeout = int(_get_runtime_param(env_params, "REQUEST_TIMEOUT", "2000", aliases=["TIMEOUT"]))
+    request_timeout = _resolve_request_timeout(llm_config)
     max_retry = int(_get_runtime_param(env_params, "MAX_RETRY", "10"))
     sleep_interval = int(_get_runtime_param(env_params, "SLEEP_INTERVAL", "5", aliases=["RETRY_INTERVAL"]))
 
@@ -148,6 +190,7 @@ async def run_task(request: TaskRequest):
         "MODEL_NAME": _get_runtime_param(env_params, "MODEL_NAME") or llm_config.get("model_name", ""),
         "BASE_URL": llm_config.get("url", ""),
         "API_KEY": llm_config.get("api_key", ""),
+        "TASK_ID": str(task_id),
         "REQUEST_TIMEOUT": str(request_timeout),
         "MAX_RETRY": str(max_retry),
         "RETRY_INTERVAL": str(sleep_interval),
@@ -167,6 +210,7 @@ async def run_task(request: TaskRequest):
                 "tool registry initialization failed: "
                 f"{e}. Check service_env_params such as SERPER_API_KEY, JINA_API_KEY, and TOOLS."
             ),
+            retryable=True,
         )
 
     inferencer = AsyncFCInferencer(
@@ -177,11 +221,35 @@ async def run_task(request: TaskRequest):
         timeout=request_timeout,
         max_retry=max_retry,
         sleep_interval=sleep_interval,
+        task_id=task_id,
     )
 
+    disconnect_task = None
+    infer_task = None
     try:
         messages = [ChatMessage(role="user", content=question)]
-        result = await inferencer.infer(messages)
+        infer_task = asyncio.create_task(inferencer.infer(messages))
+
+        if client_request is not None:
+            disconnect_task = asyncio.create_task(_wait_for_client_disconnect(client_request))
+            done, _ = await asyncio.wait(
+                {infer_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done and disconnect_task.result():
+                logger.warning(f"Client disconnected while task {task_id} was still running; cancelling inference")
+                if not infer_task.done():
+                    infer_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await infer_task
+                return TaskResponse(
+                    final_answer="",
+                    status="failed",
+                    error="client disconnected",
+                    retryable=False,
+                )
+
+        result = await infer_task
 
         final_answer = inferencer.extract_final_answer(result)
         if not str(final_answer or "").strip():
@@ -192,25 +260,40 @@ async def run_task(request: TaskRequest):
                 trajectory=result,
                 status="failed",
                 error=error,
+                retryable=(
+                    inferencer.last_retryable
+                    if inferencer.last_retryable is not None
+                    else False
+                ),
             )
 
         logger.info(f"Task {task_id} completed")
         return TaskResponse(
             final_answer=final_answer,
             trajectory=result,
-            status="completed"
+            status="completed",
         )
     except Exception as e:
         logger.error(f"Task {task_id} failed: {e}")
         return TaskResponse(
             final_answer="",
             status="failed",
-            error=str(e)
+            error=str(e),
+            retryable=True,
         )
     finally:
+        if disconnect_task is not None:
+            disconnect_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await disconnect_task
         await inferencer.close()
         if registry is not None:
             await registry.aclose()
+
+
+@app.post("/api/tasks", response_model=TaskResponse)
+async def run_task(request: TaskRequest, client_request: Request):
+    return await _run_task_impl(request, client_request)
 
 
 @app.get("/health")
@@ -227,7 +310,24 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8083)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "--timeout-keep-alive",
+        type=int,
+        default=int(os.getenv("TIMEOUT_KEEP_ALIVE", "5")),
+    )
     args = parser.parse_args()
 
-    logger.info(f"Starting on {args.host}:{args.port}")
-    uvicorn.run("service:app", host=args.host, port=args.port, workers=args.workers)
+    logger.info(
+        "Starting on %s:%s with %d worker(s), timeout_keep_alive=%ss",
+        args.host,
+        args.port,
+        args.workers,
+        args.timeout_keep_alive,
+    )
+    uvicorn.run(
+        "service:app",
+        host=args.host,
+        port=args.port,
+        workers=args.workers,
+        timeout_keep_alive=args.timeout_keep_alive,
+    )
