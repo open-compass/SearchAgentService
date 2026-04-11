@@ -48,11 +48,37 @@ class TaskRequest(BaseModel):
 
 class TaskResponse(BaseModel):
     """AgentCompass compatible response format."""
+    status: str = "completed"
     final_answer: str
     trajectory: Optional[List[Dict]] = None
-    status: str = "completed"
     error: Optional[str] = None
-    retryable: Optional[bool] = None
+
+
+def _completed_response(
+    final_answer: str,
+    *,
+    trajectory: Optional[List[Dict]] = None,
+) -> TaskResponse:
+    """Build a normal terminal response."""
+    return TaskResponse(
+        status="completed",
+        final_answer=final_answer,
+        trajectory=trajectory,
+    )
+
+
+def _error_response(
+    error: str,
+    *,
+    trajectory: Optional[List[Dict]] = None,
+) -> TaskResponse:
+    """Build a service-level error response."""
+    return TaskResponse(
+        status="error",
+        final_answer="",
+        trajectory=trajectory,
+        error=error,
+    )
 
 
 def _get_runtime_param(
@@ -150,21 +176,11 @@ async def _run_task_impl(request: TaskRequest, client_request: Request | None = 
 
     question = params.get("question", "")
     if not question:
-        return TaskResponse(
-            final_answer="",
-            status="failed",
-            error="empty question",
-            retryable=False,
-        )
+        return _error_response("empty question")
 
     config_error = _validate_request_config(llm_config, env_params)
     if config_error:
-        return TaskResponse(
-            final_answer="",
-            status="failed",
-            error=config_error,
-            retryable=False,
-        )
+        return _error_response(config_error)
 
     model_config = {
         "model": llm_config.get("model_name", ""),
@@ -203,14 +219,11 @@ async def _run_task_impl(request: TaskRequest, client_request: Request | None = 
         registry = build_default_registry(config=tool_config, tools=tools)
     except Exception as e:
         logger.error(f"Task {task_id} failed during tool registry initialization: {e}")
-        return TaskResponse(
-            final_answer="",
-            status="failed",
-            error=(
+        return _error_response(
+            (
                 "tool registry initialization failed: "
                 f"{e}. Check service_env_params such as SERPER_API_KEY, JINA_API_KEY, and TOOLS."
-            ),
-            retryable=True,
+            )
         )
 
     inferencer = AsyncFCInferencer(
@@ -242,45 +255,25 @@ async def _run_task_impl(request: TaskRequest, client_request: Request | None = 
                     infer_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await infer_task
-                return TaskResponse(
-                    final_answer="",
-                    status="failed",
-                    error="client disconnected",
-                    retryable=False,
-                )
+                return _error_response("client disconnected")
 
         result = await infer_task
 
+        terminal_status = inferencer.last_status or "completed"
         final_answer = inferencer.extract_final_answer(result)
-        if not str(final_answer or "").strip():
-            error = inferencer.last_error or "empty final answer"
-            logger.error(f"Task {task_id} failed: {error}")
-            return TaskResponse(
-                final_answer="",
-                trajectory=result,
-                status="failed",
-                error=error,
-                retryable=(
-                    inferencer.last_retryable
-                    if inferencer.last_retryable is not None
-                    else False
-                ),
-            )
+        if terminal_status == "error":
+            error = inferencer.last_error or "task execution failed"
+            logger.error(f"Task {task_id} errored: {error}")
+            return _error_response(error, trajectory=result)
 
         logger.info(f"Task {task_id} completed")
-        return TaskResponse(
-            final_answer=final_answer,
+        return _completed_response(
+            str(final_answer or ""),
             trajectory=result,
-            status="completed",
         )
     except Exception as e:
-        logger.error(f"Task {task_id} failed: {e}")
-        return TaskResponse(
-            final_answer="",
-            status="failed",
-            error=str(e),
-            retryable=True,
-        )
+        logger.error(f"Task {task_id} errored: {e}", exc_info=True)
+        return _error_response(str(e))
     finally:
         if disconnect_task is not None:
             disconnect_task.cancel()
@@ -291,7 +284,7 @@ async def _run_task_impl(request: TaskRequest, client_request: Request | None = 
             await registry.aclose()
 
 
-@app.post("/api/tasks", response_model=TaskResponse)
+@app.post("/api/tasks", response_model=TaskResponse, response_model_exclude_none=True)
 async def run_task(request: TaskRequest, client_request: Request):
     return await _run_task_impl(request, client_request)
 

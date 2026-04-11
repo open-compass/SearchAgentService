@@ -195,18 +195,18 @@ class AsyncFCInferencer:
 
         self.registry = registry or build_default_registry()
         self.last_error: Optional[str] = None
-        self.last_retryable: Optional[bool] = None
+        self.last_status: Optional[str] = None
 
-    def _set_failure_state(self, error: Optional[str], *, retryable: bool) -> None:
-        """Record the current terminal failure state for the request."""
+    def _set_terminal_state(self, error: Optional[str], *, status: str) -> None:
+        """Record the current terminal state for the request."""
         if error not in (None, ""):
             self.last_error = error
-        self.last_retryable = retryable
+        self.last_status = status
 
     def _clear_failure_state(self) -> None:
-        """Reset terminal failure state after a successful step."""
+        """Reset terminal state after a successful step."""
         self.last_error = None
-        self.last_retryable = None
+        self.last_status = None
 
     @staticmethod
     def _extract_status_code(exc: Exception) -> Optional[int]:
@@ -225,8 +225,8 @@ class AsyncFCInferencer:
         return None
 
     @classmethod
-    def _is_non_retryable_llm_exception(cls, exc: Exception) -> bool:
-        """Return True for prompt/auth/configuration errors that should not be retried."""
+    def _is_terminal_llm_exception(cls, exc: Exception) -> bool:
+        """Return True for prompt/auth/configuration errors that should stop retrying."""
         if isinstance(exc, (AuthenticationError, BadRequestError)):
             return True
 
@@ -252,7 +252,7 @@ class AsyncFCInferencer:
         detail = "Request deadline exceeded"
         if context:
             detail = f"{detail} while {context}"
-        self._set_failure_state(detail, retryable=False)
+        self._set_terminal_state(detail, status="error")
 
     def _ensure_time_remaining(self, context: str, *, min_remaining: float = 1.0) -> bool:
         """Return False and record a stop reason when no useful time budget remains."""
@@ -287,22 +287,22 @@ class AsyncFCInferencer:
         await asyncio.sleep(sleep_for)
         return True
 
-    async def _handle_retryable_llm_error(self, exc: Exception, attempt: int) -> bool:
-        """Handle one retryable LLM error. Returns True when the caller should retry."""
+    async def _handle_llm_retry_error(self, exc: Exception, attempt: int) -> bool:
+        """Handle one LLM request error. Returns True when the caller should retry."""
         logger.error(
-            "LLM retryable error (attempt %d/%d): %s: %s",
+            "LLM request error (attempt %d/%d): %s: %s",
             attempt + 1,
             self.max_retry,
             type(exc).__name__,
             exc,
         )
         if attempt == self.max_retry - 1:
-            self._set_failure_state(
+            self._set_terminal_state(
                 (
                     f"LLM request failed after {self.max_retry} attempts: "
                     f"{type(exc).__name__}: {exc}"
                 ),
-                retryable=True,
+                status="error",
             )
             if not self._ensure_time_remaining(
                 f"handling exhausted retries for LLM attempt {attempt + 1}",
@@ -331,9 +331,9 @@ class AsyncFCInferencer:
             response = await self._call_llm(current_messages, tools_schema)
             if response is None:
                 if self.last_error is None:
-                    self._set_failure_state(
+                    self._set_terminal_state(
                         f"LLM request failed after {self.max_retry} attempts",
-                        retryable=True,
+                        status="error",
                     )
                 break
 
@@ -355,7 +355,7 @@ class AsyncFCInferencer:
                     f"exceeding limit {self.max_tool_calls_per_turn}"
                 )
                 logger.warning(f"Too many tool calls: {tool_call_count}")
-                self._set_failure_state(error, retryable=False)
+                self._set_terminal_state(error, status="completed")
                 break
 
             logger.info(f"Tools called: {[tc.function.name for tc in message_data.tool_calls]}")
@@ -363,14 +363,14 @@ class AsyncFCInferencer:
             tool_results = await self._execute_tool_calls(message_data.tool_calls)
             if tool_results is None:
                 if self.last_error is None:
-                    self._set_failure_state("Tool execution failed", retryable=True)
+                    self._set_terminal_state("Tool execution failed", status="error")
                 break
 
             current_messages.extend(tool_results)
         else:
-            self._set_failure_state(
+            self._set_terminal_state(
                 f"Reached max iterations ({self.max_iterations}) without a final answer",
-                retryable=False,
+                status="completed",
             )
 
         return current_messages
@@ -406,38 +406,38 @@ class AsyncFCInferencer:
                 httpx.NetworkError,
                 httpx.RemoteProtocolError,
             ) as e:
-                if not await self._handle_retryable_llm_error(e, attempt):
+                if not await self._handle_llm_retry_error(e, attempt):
                     return None
             except AuthenticationError as e:
-                logger.error("LLM non-retryable authentication error: %s", e)
-                self._set_failure_state(
+                logger.error("LLM terminal authentication error: %s", e)
+                self._set_terminal_state(
                     f"LLM authentication failed: {type(e).__name__}: {e}",
-                    retryable=False,
+                    status="error",
                 )
                 return None
             except BadRequestError as e:
-                logger.error("LLM non-retryable bad request: %s", e)
-                self._set_failure_state(
+                logger.error("LLM terminal bad request: %s", e)
+                self._set_terminal_state(
                     f"LLM bad request: {type(e).__name__}: {e}",
-                    retryable=False,
+                    status="error",
                 )
                 return None
             except Exception as e:
                 status_code = self._extract_status_code(e)
-                if self._is_non_retryable_llm_exception(e):
-                    logger.error("LLM non-retryable error: %s: %s", type(e).__name__, e)
-                    self._set_failure_state(
+                if self._is_terminal_llm_exception(e):
+                    logger.error("LLM terminal error: %s: %s", type(e).__name__, e)
+                    self._set_terminal_state(
                         f"LLM request failed: {type(e).__name__}: {e}",
-                        retryable=False,
+                        status="error",
                     )
                     return None
                 if status_code == 429 or (isinstance(status_code, int) and status_code >= 500):
-                    if not await self._handle_retryable_llm_error(e, attempt):
+                    if not await self._handle_llm_retry_error(e, attempt):
                         return None
                     continue
 
-                logger.error("LLM unknown error treated as retryable: %s: %s", type(e).__name__, e)
-                if not await self._handle_retryable_llm_error(e, attempt):
+                logger.error("LLM unknown error will retry: %s: %s", type(e).__name__, e)
+                if not await self._handle_llm_retry_error(e, attempt):
                     return None
         return None
 
@@ -610,7 +610,7 @@ class AsyncFCInferencer:
         """Execute a single tool call via registry (direct function call)."""
         if not self.registry.has_tool(tool_name):
             logger.error(f"Tool not found: {tool_name}")
-            self._set_failure_state(f"Tool not found: {tool_name}", retryable=False)
+            self._set_terminal_state(f"Tool not found: {tool_name}", status="completed")
             return None
 
         try:
@@ -622,10 +622,10 @@ class AsyncFCInferencer:
                 e,
                 str(args_str)[:200],
             )
-            self._set_failure_state(
+            self._set_terminal_state(
                 f"Invalid tool arguments for '{tool_name}': "
                 f"{type(e).__name__}: {e}",
-                retryable=False,
+                status="completed",
             )
             return None
 
@@ -650,10 +650,10 @@ class AsyncFCInferencer:
 
             except Exception as e:
                 logger.error(f"Tool execution error (attempt {attempt + 1}): {e}")
-                self._set_failure_state(
+                self._set_terminal_state(
                     f"Tool '{tool_name}' failed after {attempt + 1}/{self.max_retry} attempts: "
                     f"{type(e).__name__}: {e}",
-                    retryable=True,
+                    status="error",
                 )
                 if attempt == self.max_retry - 1:
                     return None
