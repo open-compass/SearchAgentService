@@ -122,6 +122,7 @@ def is_streaming_unsupported_error(exc: Exception) -> bool:
 
 async def collect_openai_chat_stream(stream: Any, *, model_name: str) -> AggregatedChatCompletion:
     """Consume a chat-completions stream and aggregate it back into one response."""
+    chunk_count = 0
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
     tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
@@ -135,6 +136,11 @@ async def collect_openai_chat_stream(stream: Any, *, model_name: str) -> Aggrega
         chunk_dict = _to_plain_dict(chunk)
         if not isinstance(chunk_dict, dict):
             continue
+        chunk_count += 1
+
+        error_payload = chunk_dict.get("error")
+        if error_payload:
+            raise RuntimeError(f"stream returned error payload: {error_payload}")
 
         if isinstance(chunk_dict.get("id"), str) and chunk_dict["id"]:
             response_id = chunk_dict["id"]
@@ -198,6 +204,9 @@ async def collect_openai_chat_stream(stream: Any, *, model_name: str) -> Aggrega
 
             if isinstance(choice.get("finish_reason"), str) and choice["finish_reason"]:
                 finish_reason = choice["finish_reason"]
+
+    if chunk_count == 0:
+        raise RuntimeError("stream returned no chunks")
 
     tool_calls = None
     if tool_calls_by_index:
