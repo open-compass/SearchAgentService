@@ -254,6 +254,16 @@ class AsyncFCInferencer:
             detail = f"{detail} while {context}"
         self._set_terminal_state(detail, status="error")
 
+    def _is_context_window_error(self, exc: Exception) -> bool:
+        """Return True when the upstream error indicates prompt/context overflow."""
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return (
+            "context length" in text
+            or ("input tokens" in text and "maximum input length" in text)
+            or "maximum context length" in text
+            or "context window" in text
+        )
+
     def _ensure_time_remaining(self, context: str, *, min_remaining: float = 1.0) -> bool:
         """Return False and record a stop reason when no useful time budget remains."""
         remaining = self._remaining_budget()
@@ -417,9 +427,10 @@ class AsyncFCInferencer:
                 return None
             except BadRequestError as e:
                 logger.error("LLM terminal bad request: %s", e)
+                terminal_status = "completed" if self._is_context_window_error(e) else "error"
                 self._set_terminal_state(
                     f"LLM bad request: {type(e).__name__}: {e}",
-                    status="error",
+                    status=terminal_status,
                 )
                 return None
             except Exception as e:
